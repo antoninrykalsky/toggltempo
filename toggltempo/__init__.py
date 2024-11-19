@@ -2,6 +2,8 @@ from argparse import ArgumentParser, RawTextHelpFormatter, Namespace
 import sys
 from pathlib import Path
 from dataclasses import dataclass
+from requests.auth import HTTPBasicAuth
+from tempoapiclient import client_v4
 from typing import *
 import requests
 import requests.auth
@@ -20,6 +22,13 @@ DEFAULT_CONFIG_FILE = '''jira_tempo:
 toggl_track:
   email: ''  # Enter your e-mail and password to the Toggl Track service
   password: ''  # This is only needed if submitting data through the Toggl Track API. Leave it empty if submitting file-based data.
+settings:
+  merge_identical_entries: false    # Set true, if you want to join identical work logs in one block in Tempo.
+  attribute_mapping: []             # Set mapping, if you want to map Toggl tags to attributes in Tempo.
+#    - attribute: _WorkType_          
+#      default: Development
+#      tags:
+#        meeting: "Analysing&Budgeting"
 '''
 
 
@@ -44,12 +53,14 @@ def time_str_to_seconds(time_str: str) -> int:
 @dataclass
 class TempoEntry:
     date: str
-    issue_id: str
+    issue_key: str
     time_logged_seconds: int
     description: str
+    start_time: str
+    tags: list
 
     def __repr__(self):
-        return f'{self.date} | {self.issue_id:10} | {seconds_to_human_readable(self.time_logged_seconds):10} | {self.description}'
+        return f'{self.date} | {self.issue_key:10} | {seconds_to_human_readable(self.time_logged_seconds):10} | {self.description}'
 
 
 @dataclass
@@ -61,6 +72,8 @@ class Config:
     jira_baseurl: str
     toggl_email: str
     toggl_password: str
+    merge_identical_entries: bool
+    attribute_mapping: list
 
 
 class ConfigNotInitializedException(Exception):
@@ -68,9 +81,10 @@ class ConfigNotInitializedException(Exception):
 
 
 class TogglTrackApi:
-    def __init__(self, toggl_email: str, toggl_password: str):
+    def __init__(self, toggl_email: str, toggl_password: str, merge_identical_entries: bool):
         self.toggl_email = toggl_email
         self.toggl_password = toggl_password
+        self.merge_identical_entries = merge_identical_entries
 
     def get_entries_for_date(self, date: str) -> List[TempoEntry]:
         response = requests.get(
@@ -113,6 +127,7 @@ class TogglTrackApi:
         for time_entry_obj in response.json():
             duration = time_entry_obj['duration']
             description = time_entry_obj['description']
+            start_time = _get_time(time_entry_obj['start'])
 
             if 'tags' in time_entry_obj:
                 if 'nobill' in time_entry_obj['tags']:
@@ -134,11 +149,15 @@ class TogglTrackApi:
                     date,
                     issue_id,
                     duration,
-                    description
+                    description,
+                    start_time,
+                    time_entry_obj['tags']
                 )
             )
 
-        return self._merge_identical_entries(result)
+        if self.merge_identical_entries:
+            self._merge_identical_entries(result)
+        return result
 
     def _get_project_name_from_id(self, workspace_id: int, project_id: int) -> str:
         response = requests.get(
@@ -157,7 +176,7 @@ class TogglTrackApi:
     def _merge_identical_entries(self, tempo_entries: List[TempoEntry]) -> List[TempoEntry]:
         result = {}
         for entry in tempo_entries:
-            key = f'{entry.issue_id}@@@{entry.description}'
+            key = f'{entry.issue_key}@@@{entry.description}'
             if key in result:
                 result[key].time_logged_seconds += entry.time_logged_seconds
             else:
@@ -221,11 +240,11 @@ def read_report_file(report_file: Path) -> List[TempoEntry]:
         if line.startswith('#'):
             continue
 
-        issue_id, time, description = line.split(' ', maxsplit=2)
+        issue_key, time, description = line.split(' ', maxsplit=2)
         result.append(
             TempoEntry(
                 date,
-                issue_id,
+                issue_key,
                 time_str_to_seconds(time),
                 description
             )
@@ -250,33 +269,59 @@ def read_config_file(configfile: Path) -> Config:
                 yml['jira_tempo']['jira_baseurl'],
                 yml['toggl_track']['email'],
                 yml['toggl_track']['password'],
+                yml['settings']['merge_identical_entries'],
+                yml['settings']['attribute_mapping'],
             )
         except KeyError as e:
             print(f'Could not parse config file "{configfile.resolve()}". Missing a key: {e}. Expected format:\n---\n{DEFAULT_CONFIG_FILE}', file=sys.stderr)
             raise e
 
 
+def get_issue_id(issue_key: str, config: Config):
+
+    jira_baseurl = config.jira_baseurl
+    username = config.atlassian_username
+    api_token = config.atlassian_api_token
+
+    url = f"https://{jira_baseurl}/rest/api/3/issue/{issue_key}"
+    headers = {
+        "Authorization": f"Basic {username}:{api_token}",
+        "Accept": "application/json"
+    }
+    response = requests.get(url, auth=HTTPBasicAuth(username, api_token))
+
+    if response.status_code == 200:
+        issue_id = response.json().get("id")
+        if issue_id:
+            return issue_id
+        else:
+            raise Exception("Chybí issueId v odpovědi.")
+    else:
+        raise Exception(f"Chyba při získávání issueId: {response.status_code} {response.text}")
+
+
 def send_entries_to_tempo(date: str, entries: List[TempoEntry], config: Config):
+
+    tempo = client_v4.Tempo(
+        auth_token=config.jira_tempo_api_token,
+    )
+
     for entry in entries:
-        data = {
-            "issueKey": entry.issue_id,
-            "timeSpentSeconds": entry.time_logged_seconds,
-            "startDate": date,
-            "startTime": "09:00:00",
-            "description": entry.description,
-            "authorAccountId": config.jira_tempo_user_id
-        }
+        attributes = _map_attributes(entry, config)
+        issue_id = get_issue_id(entry.issue_key, config)
+        start_time = "9:00:00" if config.merge_identical_entries else entry.start_time
 
-        response = requests.post(
-            'https://api.tempo.io/core/3/worklogs/',
-            json=data,
-            headers={
-                'Authorization': f'Bearer {config.jira_tempo_api_token}'
-            }
+        tempo.create_worklog(
+            accountId=config.jira_tempo_user_id,
+            issueId=issue_id,
+            dateFrom=date,
+            timeSpentSeconds=entry.time_logged_seconds,
+            description=entry.description,
+            startTime=start_time,
+            attributes=attributes
         )
-        response.raise_for_status()
 
-        print(f'  {entry.issue_id} ✅')
+        print(f'  {entry.issue_key} ✅')
 
 
 def assert_date_format_yyyy_mm_dd(date: str):
@@ -351,7 +396,7 @@ def _cmd_import_jira_ticket_to_toggl(args: Namespace):
 
     js = response.json()
     summary = js['fields']['summary']
-    api = TogglTrackApi(config.toggl_email, config.toggl_password)
+    api = TogglTrackApi(config.toggl_email, config.toggl_password, config.merge_identical_entries)
 
     toggl_project_name = f'{jira_id} {summary}'.strip()
 
@@ -403,7 +448,7 @@ def _cmd_track_time(args: Namespace):
         # read toggl api
         assert_date_format_yyyy_mm_dd(date)
         print('Reading entries from Toggl API')
-        api = TogglTrackApi(config.toggl_email, config.toggl_password)
+        api = TogglTrackApi(config.toggl_email, config.toggl_password, config.merge_identical_entries)
         tempo_entries = api.get_entries_for_date(date)
 
     errors = []
@@ -412,7 +457,7 @@ def _cmd_track_time(args: Namespace):
     for entry in tempo_entries:
         entry_line = f'  - {entry}'
         if entry.description.strip() == '':
-            errors.append(f'Entry for {entry.issue_id} is missing a description')
+            errors.append(f'Entry for {entry.issue_key} is missing a description')
             entry_line += ' ⚠️'
         print(entry_line)
     print('')
@@ -433,6 +478,35 @@ def _cmd_track_time(args: Namespace):
 
     send_entries_to_tempo(date, tempo_entries, config)
     print('All sent 🎉')
+
+
+def _map_attributes(entry: TempoEntry, config: Config):
+    attributes = []
+    for item in config.attribute_mapping:
+        attribute = {
+            'key': item['attribute'],
+            'value': item['default'],
+        }
+        if 'tags' in item:
+            for tag, attribute_name in item['tags'].items():
+                if tag in entry.tags:
+                    attribute['value'] = attribute_name
+        attributes.append(attribute)
+
+    return attributes
+
+
+def _get_time(datetime_str: str):
+    """
+    Parse time from a toggle format to tempo format
+    "2023-11-01T15:06:49+00:00" -> "15:06:49"
+    """
+
+    dt = datetime.datetime.fromisoformat(datetime_str)
+
+    time_str = dt.strftime("%H:%M:%S")
+
+    return time_str
 
 
 def main():

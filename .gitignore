@@ -1,0 +1,6 @@
+tempo_api_python_client.egg-info
+dist
+build
+*.egg-info
+__pycache__
+.idea/
