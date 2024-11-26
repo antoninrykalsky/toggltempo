@@ -74,6 +74,7 @@ class Config:
     toggl_password: str
     merge_identical_entries: bool
     attribute_mapping: list
+    client: str
 
 
 class ConfigNotInitializedException(Exception):
@@ -86,7 +87,35 @@ class TogglTrackApi:
         self.toggl_password = toggl_password
         self.merge_identical_entries = merge_identical_entries
 
-    def get_entries_for_date(self, date: str) -> List[TempoEntry]:
+
+    def get_client_id(self, client_demanded: str):
+        response = requests.get(
+            f'https://api.track.toggl.com/api/v9/me/clients',
+            {},
+            auth=requests.auth.HTTPBasicAuth(self.toggl_email, self.toggl_password),
+            headers={
+                'Content-Type': 'application/json',
+            }
+        )
+
+        return [client['id'] for client in response.json() if client['name'] == client_demanded][0]
+
+    def get_client_projects(self, client_demanded: str) -> List[TempoEntry]:
+
+        client_id = self.get_client_id(client_demanded)
+
+        response = requests.get(
+            f'https://api.track.toggl.com/api/v9/me/projects',
+            {},
+            auth=requests.auth.HTTPBasicAuth(self.toggl_email, self.toggl_password),
+            headers={
+                'Content-Type': 'application/json',
+            }
+        )
+
+        return [project['id'] for project in response.json() if project['client_id'] == client_id ]
+
+    def get_entries_for_date(self, date: str, client: str) -> List[TempoEntry]:
         response = requests.get(
             'https://api.track.toggl.com/api/v9/me/time_entries',
             {
@@ -123,11 +152,16 @@ class TogglTrackApi:
           }
         """
 
+        client_projects = self.get_client_projects(client)
+
         result = []
         for time_entry_obj in response.json():
             duration = time_entry_obj['duration']
             description = time_entry_obj['description']
             start_time = _get_time(time_entry_obj['start'])
+
+            if time_entry_obj['project_id'] not in client_projects:
+                continue
 
             if 'tags' in time_entry_obj:
                 if 'nobill' in time_entry_obj['tags']:
@@ -183,7 +217,7 @@ class TogglTrackApi:
                 result[key] = entry
         return list(result.values())
 
-    def create_project(self, project_name: str) -> str:
+    def create_project(self, project_name: str, client_id: int) -> str:
         """
         Create a project in Toggl Track
         :param project_name: the full name of the project, e.g. "RH-1234 Some ticket thing"
@@ -201,6 +235,7 @@ class TogglTrackApi:
                 "active": True,
                 "is_private": False,
                 "name": project_name,
+                "client_id": client_id,
             }
         )
         try:
@@ -271,6 +306,7 @@ def read_config_file(configfile: Path) -> Config:
                 yml['toggl_track']['password'],
                 yml['settings']['merge_identical_entries'],
                 yml['settings']['attribute_mapping'],
+                yml['settings']['client'],
             )
         except KeyError as e:
             print(f'Could not parse config file "{configfile.resolve()}". Missing a key: {e}. Expected format:\n---\n{DEFAULT_CONFIG_FILE}', file=sys.stderr)
@@ -405,7 +441,9 @@ def _cmd_import_jira_ticket_to_toggl(args: Namespace):
         print('Aborting, goodbye.')
         return
 
-    api.create_project(toggl_project_name)
+    client_id = api.get_client_id(config.client)
+
+    api.create_project(toggl_project_name, client_id)
     print('Project created in Toggl Track, you can now use it in time tracking ✅')
 
 
@@ -449,7 +487,7 @@ def _cmd_track_time(args: Namespace):
         assert_date_format_yyyy_mm_dd(date)
         print('Reading entries from Toggl API')
         api = TogglTrackApi(config.toggl_email, config.toggl_password, config.merge_identical_entries)
-        tempo_entries = api.get_entries_for_date(date)
+        tempo_entries = api.get_entries_for_date(date, config.client)
 
     errors = []
     print(f'Will log the following entries into date "{date}":')
